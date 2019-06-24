@@ -333,26 +333,27 @@ func (c *clientConn) handleRecv() {
 	}()
 
 	for {
-		select {
-		case <-c.ctx.Done():
+		pkt, err := Decode(c.protoVersion, c.connRW)
+		if err != nil {
+			c.parent.log.e("NET connection broken, server =", c.name, "err =", err)
+
+			// TODO send proper net error to net handler
+
+			// exit client connection
+			c.exit()
 			return
-		default:
-			pkt, err := Decode(c.protoVersion, c.connRW)
-			if err != nil {
-				c.parent.log.e("NET connection broken, server =", c.name, "err =", err)
+		}
 
-				// TODO send proper net error to net handler
-
-				// exit client connection
-				c.exit()
-				return
+		if pkt == PingRespPacket {
+			c.parent.log.d("NET received keepalive message")
+			select {
+			case c.keepaliveC <- 1:
+			case <-c.ctx.Done():
 			}
-
-			if pkt == PingRespPacket {
-				c.parent.log.d("NET received keepalive message")
-				c.keepaliveC <- 1
-			} else {
-				c.netRecvC <- pkt
+		} else {
+			select {
+			case c.netRecvC <- pkt:
+			case <-c.ctx.Done():
 			}
 		}
 	}
