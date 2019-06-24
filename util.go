@@ -18,6 +18,7 @@ package libmqtt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -289,4 +290,25 @@ func getUserProps(data []byte) UserProps {
 		props[strKey] = append(props[strKey], val)
 	}
 	return props
+}
+
+// honorContext performs a potentially long-running task, while respecting ctx.
+// If non-nil, the task will be registered with the given WaitGroup.
+func honorContext(ctx context.Context, wg *sync.WaitGroup, task func() error) error {
+	errCh := make(chan error)
+	if wg != nil {
+		wg.Add(1)
+	}
+	go func() {
+		if wg != nil {
+			defer wg.Done()
+		}
+		errCh <- task()
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

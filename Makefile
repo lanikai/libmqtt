@@ -25,6 +25,9 @@ test:
 test_auth:
 	go test ${TEST_FLAGS} -run=TestAuth
 
+test_cli:
+	go test ${TEST_FLAGS} -run=TestClient
+
 test_conn:
 	go test ${TEST_FLAGS} -run=TestConn
 	go test ${TEST_FLAGS} -run=TestDisConn

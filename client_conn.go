@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -36,6 +37,23 @@ type clientConn struct {
 	keepaliveC   chan int           // keepalive packet
 	ctx          context.Context    // context for single connection
 	exit         context.CancelFunc // terminate this connection if necessary
+}
+
+func newClientConn(protoVersion ProtoVersion, parent *AsyncClient, name string, conn net.Conn) *clientConn {
+	ctx, cancel := context.WithCancel(parent.ctx)
+
+	return &clientConn{
+		protoVersion: protoVersion,
+		parent:       parent,
+		name:         name,
+		conn:         conn,
+		connRW:       bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
+		keepaliveC:   make(chan int),
+		logicSendC:   make(chan Packet),
+		netRecvC:     make(chan Packet),
+		ctx:          ctx,
+		exit:         cancel,
+	}
 }
 
 // start mqtt logic
@@ -342,9 +360,32 @@ func (c *clientConn) handleRecv() {
 
 // send mqtt logic packet
 func (c *clientConn) send(pkt Packet) {
-	if c.parent.isClosing() {
-		return
+	select {
+	case c.logicSendC <- pkt:
+	case <-c.ctx.Done():
 	}
+}
 
-	c.logicSendC <- pkt
+type connAckError byte
+
+func (e connAckError) Error() string {
+	return "CONNACK failure: " + strconv.Itoa(int(e))
+}
+
+func (c *clientConn) waitForConnAck(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case pkt, more := <-c.netRecvC:
+		if !more || pkt.Type() != CtrlConnAck {
+			return ErrDecodeBadPacket
+		}
+
+		p := pkt.(*ConnAckPacket)
+		if p.Code != CodeSuccess {
+			return connAckError(p.Code)
+		} else {
+			return nil
+		}
+	}
 }

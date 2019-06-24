@@ -17,7 +17,6 @@
 package libmqtt
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -120,12 +119,12 @@ func (c *AsyncClient) Connect(h ConnHandler) {
 
 	for _, s := range c.options.servers {
 		c.workers.Add(1)
-		go c.connect(s, false, h, c.options.protoVersion, c.options.firstDelay)
+		go c.connect(s, false, h)
 	}
 
 	for _, s := range c.options.secureServers {
 		c.workers.Add(1)
-		go c.connect(s, true, h, c.options.protoVersion, c.options.firstDelay)
+		go c.connect(s, true, h)
 	}
 
 	c.workers.Add(2)
@@ -241,156 +240,108 @@ func (c *AsyncClient) HandlePersist(h PersistHandler) {
 }
 
 // connect to one server and start mqtt logic
-func (c *AsyncClient) connect(server string, secure bool, h ConnHandler, version ProtoVersion, reconnectDelay time.Duration) {
+func (c *AsyncClient) connect(server string, secure bool, h ConnHandler) {
 	defer c.workers.Done()
 
-	var (
-		conn net.Conn
-		err  error
-	)
+	// Number of failures since the last successful connection.
+	nfail := 0
 
-	tlsConfig := c.options.tlsConfig
-	if secure {
-		tlsConfig = c.options.defaultTlsConfig
+	for !c.isClosing() {
+		tlsConfig := c.options.tlsConfig
+		if secure {
+			tlsConfig = c.options.defaultTlsConfig
+		}
+
+		if connImpl, err := c.tryConnect(server, tlsConfig); err != nil {
+			nfail++
+			c.log.e("CLI connect failed, err =", err, "server =", server, "failure count =", nfail)
+			if h != nil {
+				code := byte(math.MaxUint8)
+				if conerr, ok := err.(connAckError); ok {
+					code = byte(conerr)
+				}
+				go h(server, code, err)
+			}
+		} else {
+			nfail = 0
+			c.log.i("CLI connected to server =", server)
+			if h != nil {
+				go h(server, CodeSuccess, nil)
+			}
+
+			// login success, start mqtt logic
+			connImpl.logic()
+		}
+
+		if c.isClosing() || !c.options.autoReconnect {
+			return
+		}
+
+		// reconnect delay
+		var delay time.Duration
+		if nfail > 0 {
+			delay = time.Duration(float64(c.options.firstDelay) * math.Pow(c.options.backOffFactor, float64(nfail-1)))
+			if delay > c.options.maxDelay {
+				delay = c.options.maxDelay
+			}
+		}
+		c.log.e("CLI reconnecting to server =", server, "delay =", delay)
+
+		select {
+		case <-c.ctx.Done():
+		case <-time.After(delay):
+		}
+	}
+}
+
+func (c *AsyncClient) tryConnect(server string, tlsConfig *tls.Config) (*clientConn, error) {
+	// Enforce timeout for establishing connection.
+	dialCtx, cancel := context.WithTimeout(c.ctx, c.options.dialTimeout)
+	defer cancel()
+
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(dialCtx, "tcp", server)
+	if err != nil {
+		return nil, err
 	}
 
 	if tlsConfig != nil {
-		// with tls
-		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: c.options.dialTimeout}, "tcp", server, tlsConfig)
-		if err != nil {
-			c.log.e("CLI connect with tls failed, err =", err, "server =", server, "secure_server =", secure)
-			if h != nil {
-				go h(server, math.MaxUint8, err)
-			}
-
-			if c.options.autoReconnect && !c.isClosing() {
-				goto reconnect
-			}
-			return
+		// Perform TLS handshake.
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := honorContext(dialCtx, c.workers, tlsConn.Handshake); err != nil {
+			conn.Close()
+			return nil, err
 		}
-	} else {
-		// without tls
-		conn, err = net.DialTimeout("tcp", server, c.options.dialTimeout)
-		if err != nil {
-			c.log.e("CLI connect failed, err =", err, "server =", server)
-			if h != nil {
-				go h(server, math.MaxUint8, err)
-			}
-
-			if c.options.autoReconnect && !c.isClosing() {
-				goto reconnect
-			}
-			return
-		}
-	}
-	defer conn.Close()
-	{
-		if c.isClosing() {
-			return
-		}
-
-		connImpl := &clientConn{
-			protoVersion: version,
-			parent:       c,
-			name:         server,
-			conn:         conn,
-			connRW:       bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
-			keepaliveC:   make(chan int),
-			logicSendC:   make(chan Packet),
-			netRecvC:     make(chan Packet),
-		}
-		connImpl.ctx, connImpl.exit = context.WithCancel(c.ctx)
-
-		c.workers.Add(2)
-		go connImpl.handleSend()
-		go connImpl.handleRecv()
-
-		connImpl.send(&ConnPacket{
-			Username:     c.options.username,
-			Password:     c.options.password,
-			ClientID:     c.options.clientID,
-			CleanSession: c.options.cleanSession,
-			IsWill:       c.options.isWill,
-			WillQos:      c.options.willQos,
-			WillTopic:    c.options.willTopic,
-			WillMessage:  c.options.willPayload,
-			WillRetain:   c.options.willRetain,
-			Keepalive:    uint16(c.options.keepalive / time.Second),
-		})
-
-		dialTimer := time.NewTimer(c.options.dialTimeout)
-		defer dialTimer.Stop()
-		select {
-		case <-c.ctx.Done():
-			return
-		case pkt, more := <-connImpl.netRecvC:
-			if !more {
-				if h != nil {
-					go h(server, math.MaxUint8, ErrDecodeBadPacket)
-				}
-				close(connImpl.logicSendC)
-				return
-			}
-
-			if pkt.Type() == CtrlConnAck {
-				p := pkt.(*ConnAckPacket)
-
-				if p.Code != CodeSuccess {
-					close(connImpl.logicSendC)
-					if version > V311 && c.options.protoCompromise && p.Code == CodeUnsupportedProtoVersion {
-						c.workers.Add(1)
-						go c.connect(server, secure, h, version-1, reconnectDelay)
-						return
-					}
-
-					if h != nil {
-						go h(server, p.Code, nil)
-					}
-					return
-				}
-			} else {
-				close(connImpl.logicSendC)
-				if h != nil {
-					go h(server, math.MaxUint8, ErrDecodeBadPacket)
-				}
-				return
-			}
-		case <-dialTimer.C:
-			close(connImpl.logicSendC)
-			if h != nil {
-				go h(server, math.MaxUint8, ErrTimeOut)
-			}
-			return
-		}
-
-		c.log.i("CLI connected to server =", server)
-		if h != nil {
-			go h(server, CodeSuccess, nil)
-		}
-
-		// login success, start mqtt logic
-		connImpl.logic()
-
-		if c.isClosing() {
-			return
-		}
-	}
-reconnect:
-	// reconnect
-	c.log.e("CLI reconnecting to server =", server, "delay =", reconnectDelay)
-	time.Sleep(reconnectDelay)
-
-	if c.isClosing() {
-		return
+		conn = tlsConn
 	}
 
-	reconnectDelay = time.Duration(float64(reconnectDelay) * c.options.backOffFactor)
-	if reconnectDelay > c.options.maxDelay {
-		reconnectDelay = c.options.maxDelay
+	connImpl := newClientConn(c.options.protoVersion, c, server, conn)
+
+	c.workers.Add(2)
+	go connImpl.handleSend()
+	go connImpl.handleRecv()
+
+	connImpl.send(&ConnPacket{
+		Username:     c.options.username,
+		Password:     c.options.password,
+		ClientID:     c.options.clientID,
+		CleanSession: c.options.cleanSession,
+		IsWill:       c.options.isWill,
+		WillQos:      c.options.willQos,
+		WillTopic:    c.options.willTopic,
+		WillMessage:  c.options.willPayload,
+		WillRetain:   c.options.willRetain,
+		Keepalive:    uint16(c.options.keepalive / time.Second),
+	})
+
+	if err := connImpl.waitForConnAck(dialCtx); err != nil {
+		connImpl.exit()
+		conn.Close()
+		return nil, err
 	}
 
-	c.workers.Add(1)
-	go c.connect(server, secure, h, version, reconnectDelay)
+	return connImpl, nil
+
 }
 
 func (c *AsyncClient) isClosing() bool {
