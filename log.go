@@ -47,43 +47,31 @@ type logger struct {
 	error   *log.Logger
 }
 
-const (
-	logFlag = log.Ltime | log.Ldate
-)
-
-func newStdLogger() *log.Logger {
-	l := &log.Logger{}
-	l.SetFlags(logFlag)
-	l.SetOutput(os.Stderr)
-	return l
+func newStdLogger(level string) *log.Logger {
+	return log.New(os.Stdout, level+"/libmqtt ", 0)
 }
 
 func newLogger(l LogLevel) *logger {
 	lo := &logger{}
 
 	if l <= Error {
-		lo.error = newStdLogger()
-		lo.error.SetPrefix("[LIBMQTT] E ")
+		lo.error = newStdLogger("E")
 	}
 
 	if l <= Warning {
-		lo.warning = newStdLogger()
-		lo.warning.SetPrefix("[LIBMQTT] W ")
+		lo.warning = newStdLogger("W")
 	}
 
 	if l <= Info {
-		lo.info = newStdLogger()
-		lo.info.SetPrefix("[LIBMQTT] I ")
+		lo.info = newStdLogger("I")
 	}
 
 	if l <= Debug {
-		lo.debug = newStdLogger()
-		lo.debug.SetPrefix("[LIBMQTT] D ")
+		lo.debug = newStdLogger("D")
 	}
 
 	if l <= Verbose {
-		lo.verbose = newStdLogger()
-		lo.verbose.SetPrefix("[LIBMQTT] V ")
+		lo.verbose = newStdLogger("V")
 	}
 
 	if l <= Silent {
